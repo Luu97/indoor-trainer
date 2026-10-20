@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>D100 Steuerung</title>
+<style>
+  :root {
+    --bg: #f6f7f5; --fg: #1b2420; --muted: #5d6a63; --line: #d3d9d5;
+    --accent: #0a6b4f; --accent-fg: #ffffff; --panel: #ffffff; --err: #b3261e;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121715; --fg: #e8eeea; --muted: #94a39a; --line: #2c3631;
+      --accent: #4cc39a; --accent-fg: #07130e; --panel: #1a211e; --err: #ff8a80; color-scheme: dark; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  main { max-width: 34rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  p.sub { margin: 0 0 1.25rem; color: var(--muted); }
+  button { font: inherit; padding: .6rem 1rem; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .live { display: grid; grid-template-columns: repeat(3, 1fr); gap: .5rem; margin-bottom: 1.25rem; }
+  .live div { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .75rem; }
+  .live b { display: block; font-size: 1.75rem; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .live span { color: var(--muted); font-size: .85rem; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; padding: .75rem 1rem 1rem; margin: 0 0 1rem; background: var(--panel); }
+  legend { padding: 0 .4rem; color: var(--muted); }
+  label { display: block; margin-bottom: .25rem; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  #status { color: var(--muted); min-height: 1.5em; }
+  #status.err { color: var(--err); }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .75rem;
+    max-height: 10rem; overflow: auto; font-size: .8rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>D100 Steuerung</h1>
+  <p class="sub">Verbindet per Bluetooth (FTMS) mit dem Van Rysel D100. Nur Chrome oder Edge, Zwift und Onelap vorher schließen.</p>
+
+  <div class="row">
+    <button id="connect" class="primary">Verbinden</button>
+    <button id="disconnect" disabled>Trennen</button>
+  </div>
+  <p id="status">Nicht verbunden.</p>
+
+  <div class="live" aria-live="off">
+    <div><b id="vPower">–</b><span>Watt</span></div>
+    <div><b id="vCad">–</b><span>U/min</span></div>
+    <div><b id="vSpeed">–</b><span>km/h</span></div>
+  </div>
+
+  <fieldset id="ergBox" disabled>
+    <legend>Zielleistung (ERG)</legend>
+    <label for="power">Ziel: <output id="powerOut">150</output> W</label>
+    <input id="power" type="range" min="50" max="600" step="5" value="150">
+  </fieldset>
+
+  <fieldset id="simBox" disabled>
+    <legend>Steigung (Simulation)</legend>
+    <label for="grade">Steigung: <output id="gradeOut">0.0</output> %</label>
+    <input id="grade" type="range" min="0" max="6" step="0.5" value="0">
+  </fieldset>
+
+  <pre id="log"></pre>
+</main>
+
+<script>
+// FTMS UUIDs (Bluetooth SIG, 16-Bit)
+const FTMS            = 0x1826;
+const CONTROL_POINT   = 0x2AD9;
+const INDOOR_BIKE_DATA = 0x2AD2;
+
+// Control-Point-Opcodes
+const OP = { REQUEST_CONTROL: 0x00, SET_TARGET_POWER: 0x05, START: 0x07, STOP: 0x08, SET_SIM: 0x11 };
+
+let device, cp, queue = Promise.resolve();
+const $ = id => document.getElementById(id);
+
+function log(msg) { $('log').textContent += msg + '\n'; $('log').scrollTop = 1e9; }
+function status(msg, isErr = false) { const s = $('status'); s.textContent = msg; s.className = isErr ? 'err' : ''; }
+
+// Schreibzugriffe nacheinander ausführen, der Trainer verarbeitet nur einen Befehl gleichzeitig
+function send(bytes) {
+  queue = queue.then(async () => {
+    const data = new Uint8Array(bytes);
+    if (cp.writeValueWithResponse) await cp.writeValueWithResponse(data);
+    else await cp.writeValue(data);
+  }).catch(e => { log('Fehler beim Senden: ' + e.message); });
+  return queue;
+}
+
+const i16 = v => [v & 0xff, (v >> 8) & 0xff]; // sint16 little endian
+
+function setTargetPower(watt) { return send([OP.SET_TARGET_POWER, ...i16(Math.round(watt))]); }
+function setGrade(percent) {
+  // Wind 0, Steigung in 0,01 %, Rollwiderstand 0,004, cw 0,51 kg/m
+  return send([OP.SET_SIM, ...i16(0), ...i16(Math.round(percent * 100)), 40, 51]);
+}
+
+// Indoor Bike Data (0x2AD2) auswerten, die Felder hängen von den Flags ab
+function parseBikeData(dv) {
+  const flags = dv.getUint16(0, true);
+  let o = 2; const out = {};
+  if (!(flags & 0x0001)) { out.speed = dv.getUint16(o, true) / 100; o += 2; }  // km/h
+  if (flags & 0x0002) o += 2;                                                   // Durchschnittsgeschwindigkeit
+  if (flags & 0x0004) { out.cadence = dv.getUint16(o, true) / 2; o += 2; }      // U/min
+  if (flags & 0x0008) o += 2;                                                   // Durchschnittskadenz
+  if (flags & 0x0010) o += 3;                                                   // Gesamtdistanz
+  if (flags & 0x0020) o += 2;                                                   // Widerstandslevel
+  if (flags & 0x0040) { out.power = dv.getInt16(o, true); o += 2; }             // Watt
+  return out;
+}
+
+function onBikeData(e) {
+  const d = parseBikeData(e.target.value);
+  if (d.power   !== undefined) $('vPower').textContent = d.power;
+  if (d.cadence !== undefined) $('vCad').textContent   = Math.round(d.cadence);
+  if (d.speed   !== undefined) $('vSpeed').textContent = d.speed.toFixed(1);
+}
+
+function onControlResponse(e) {
+  const v = e.target.value; // 0x80, Request-Opcode, Result (0x01 = Erfolg)
+  if (v.getUint8(0) === 0x80) log(`Antwort auf 0x${v.getUint8(1).toString(16)}: ${v.getUint8(2) === 1 ? 'OK' : 'Code ' + v.getUint8(2)}`);
+}
+
+async function connect() {
+  try {
+    status('Suche Trainer …');
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [FTMS] }] });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    const server  = await device.gatt.connect();
+    const service = await server.getPrimaryService(FTMS);
+
+    const bike = await service.getCharacteristic(INDOOR_BIKE_DATA);
+    bike.addEventListener('characteristicvaluechanged', onBikeData);
+    await bike.startNotifications();
+
+    cp = await service.getCharacteristic(CONTROL_POINT);
+    cp.addEventListener('characteristicvaluechanged', onControlResponse);
+    await cp.startNotifications(); // Antworten kommen als Indication
+
+    await send([OP.REQUEST_CONTROL]);
+    await send([OP.START]);
+
+    $('connect').disabled = true; $('disconnect').disabled = false;
+    $('ergBox').disabled = false; $('simBox').disabled = false;
+    status('Verbunden mit ' + (device.name || 'Trainer') + '.');
+  } catch (e) {
+    status('Verbindung fehlgeschlagen: ' + e.message, true);
+  }
+}
+
+function onDisconnected() {
+  $('connect').disabled = false; $('disconnect').disabled = true;
+  $('ergBox').disabled = true;   $('simBox').disabled = true;
+  status('Verbindung getrennt.');
+}
+
+$('connect').onclick = connect;
+$('disconnect').onclick = async () => { await send([OP.STOP, 0x01]); device.gatt.disconnect(); };
+
+// Regler: erst bei Loslassen/Änderung senden, nicht bei jedem Pixel
+$('power').oninput = e => $('powerOut').textContent = e.target.value;
+$('power').onchange = e => setTargetPower(+e.target.value);
+$('grade').oninput = e => $('gradeOut').textContent = (+e.target.value).toFixed(1);
+$('grade').onchange = e => setGrade(+e.target.value);
+
+if (!navigator.bluetooth) status('Dieser Browser unterstützt Web Bluetooth nicht. Bitte Chrome oder Edge verwenden.', true);
+</script>
+</body>
+</html>
